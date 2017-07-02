@@ -113,7 +113,8 @@ create_bundle()
 {
    debug_log "create_module" "$*"
    rm -f "$2" # overwrite, never append to existing file
-   mksquashfs "$1" "$2" -comp xz -b 512K $3 $4 $5 $6 $7 $8 $9>/dev/null
+   #mksquashfs "$1" "$2" -comp xz -b 512K $3 $4 $5 $6 $7 $8 $9>/dev/null
+   mksquashfs "$1" "$2" -comp gzip -b 128K $3 $4 $5 $6 $7 $8 $9>/dev/null
 }
 
 
@@ -148,7 +149,6 @@ init_proc_sysfs()
    ln -sf /proc/mounts /etc/mtab
 }
 
-
 # modprobe all modules found in initial ramdisk
 modprobe_everything()
 {
@@ -170,7 +170,6 @@ refresh_devs()
    fi
    mdev -s
 }
-
 
 # make sure some devices are there
 init_devs()
@@ -211,6 +210,17 @@ init_aufs()
    refresh_devs
 }
 
+# load the OVERLAY kernel module if needed
+#
+init_overlay()
+{
+   debug_log "init_overlay" "$*"
+   # TODO maybe check here if aufs support is working at all
+   # and produce useful error message if user has no aufs
+   modprobe overlay 2>/dev/null
+   refresh_devs
+}
+
 # Setup empty union
 # $1 = changes directory (ramfs or persistent changes)
 # $2 = union directory where to mount the union
@@ -220,11 +230,18 @@ init_union()
    debug_log "init_union" "$*"
 
    echo_green_star
-   echo "Setting up union using AUFS 3"
+   if [ -z "$aufs" ]; then
+       echo "Setting up union using OVERLAYFS"
+   else
+       echo "Setting up union using AUFS"
+   fi
    mkdir -p "$1"
    mkdir -p "$2"
-   mount -t aufs -o xino="/.xino",trunc_xino,br="$1" aufs "$2"
+   if [ ! -z "$aufs" ]; then
+		mount -t aufs -o xino="/.xino",trunc_xino,br="$1" aufs "$2"
+   fi
 }
+
 
 # Return device mounted for given directory
 # $1 = directory
@@ -480,6 +497,7 @@ persistent_changes()
 
    # If persistent changes are not requested, end here
    if grep -vq perch /proc/cmdline; then
+      NOCHANGE="yes"
       return
    fi
 
@@ -489,6 +507,7 @@ persistent_changes()
    # if not, simply return back
    if [ $? -ne 0 ]; then
       echo "* Persistent changes not writable or not used"
+      NOCHANGE="yes"
       return
    fi
 
@@ -598,8 +617,6 @@ sortmod()
 # and add them to union
 # $1 = directory where to search for bundles
 # $2 = directory where to mount bundles
-# $3 = directory where union is mounted
-#
 union_append_bundles()
 {
    debug_log "union_append_bundles" "$*"
@@ -613,7 +630,29 @@ union_append_bundles()
       BUN="$(basename "$BUNDLE")"
       mkdir -p "$2/$BUN"
       mount -o loop -t squashfs "$1/$BUNDLE" "$2/$BUN"
-      mount -o remount,add:1:"$2/$BUN" aufs "$3"
+      if [ ! -z "$aufs" ]; then
+          mount -o remount,add:1:"$2/$BUN" aufs "$3"
+	  fi
+   done
+}
+
+union_append_bundles_modpath()
+{
+   debug_log "union_append_bundles_modpath" "$*"
+
+   local BUN MOD
+
+   echo_green_star
+   MOD="$3"
+   echo "Adding modpath ${MOD}/ bundles to union"
+   ( ls -1 "$1" | sort -n ; cd "$1" ; find "${MOD}"/ 2>/dev/null | sortmod | filter_load) | grep '[.]'$BEXT'$' | filter_noload | while read BUNDLE; do
+      echo "* $BUNDLE"
+      BUN="$(basename "$BUNDLE")"
+      mkdir -p "$2/$BUN"
+      mount -o loop -t squashfs "$1/$BUNDLE" "$2/$BUN"
+      if [ ! -z "$aufs" ]; then
+          mount -o remount,add:1:"$2/$BUN" aufs "$4"
+      fi
    done
 }
 
@@ -626,11 +665,17 @@ fstab_create()
 
    local FSTAB
    FSTAB="$1/etc/fstab"
-   echo aufs / aufs defaults 0 0 > $FSTAB
-   echo proc /proc proc defaults 0 0 >> $FSTAB
-   echo sysfs /sys sysfs defaults 0 0 >> $FSTAB
+   if [ ! -z "$aufs" ]; then
+       echo aufs / aufs defaults 0 0 > $FSTAB
+   else
+       echo overlay / overlay defaults 0 0 > $FSTAB
+   fi
+   echo proc /proc proc nosuid,noexec,nodev 0 0 >> $FSTAB
+   echo sysfs /sys sysfs nosuid,noexec,nodev 0 0 >> $FSTAB
    echo devpts /dev/pts devpts gid=5,mode=620 0 0 >> $FSTAB
    echo tmpfs /dev/shm tmpfs defaults 0 0 >> $FSTAB
+   echo tmpfs /run tmpfs defaults 0 0 >> $FSTAB
+   echo tmpfs /tmp tmpfs defaults 0 0 >> $FSTAB
 }
 
 
@@ -655,6 +700,7 @@ change_root()
    if [ ! -e dev/tty1 ]; then mknod dev/tty1 c 4 1; fi
    if [ ! -e dev/null ]; then mknod dev/null c 1 3; fi
    if [ ! -e sbin/fsck.aufs ]; then ln -s /bin/true sbin/fsck.aufs; fi
+   if [ ! -e sbin/fsck.overlayfs ]; then ln -s /bin/true sbin/fsck.overlayfs; fi
 
    # find chroot and init
    if [ -x bin/chroot -o -L bin/chroot ]; then  CHROOT=bin/chroot; fi
@@ -668,7 +714,12 @@ change_root()
    if [ "$INIT" = "" ]; then fatal "Can't find executable init command"; fi
 
    mkdir -p mnt/live
-   mount -n -o remount,ro aufs .
+   if [ ! -z "$aufs" ]; then
+       mount -n -o remount,ro aufs .
+   else
+       mount -n -o remount,ro overlay .
+   fi
+
    pivot_root . mnt/live
    exec $CHROOT . $INIT < dev/console > dev/console 2>&1
 }
