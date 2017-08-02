@@ -630,6 +630,7 @@ persistent_changes()
 
     # If persistent changes are not requested, end here
     if grep -vq 'perch' /proc/cmdline; then
+        NOCHANGE="yes"
         return
     fi
 
