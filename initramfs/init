@@ -2,13 +2,21 @@
 # Initial script for Linux Live Kit
 # Author: Tomas M <http://www.linux-live.org/>
 
+# Modify and export/declare new PATH
 export PATH=.:/:/usr/sbin:/usr/bin:/sbin:/bin
 
+# Source Live Kit library script
 . /lib/.config
 . /lib/livekitlib
 
+# Declare start of 'init' state
+clear
+echo_sign "INIT START"
+
+# Run switch_root: initramfs -> tmpfs
 transfer_initramfs
 
+# Directory variables pointing to /memory
 MEMORY=/memory
 CHANGES=$MEMORY/changes
 UNION=$MEMORY/union
@@ -17,62 +25,90 @@ BUNDLES=$MEMORY/bundles
 WORK=$MEMORY/work
 SYSTEM=$MEMORY/system
 
-header "Live Kit init <http://www.linux-live.org/>"
-
+# Initliaise /proc, /sys and such
 init_proc_sysfs
 
+# Initialise debugging if requested
 debug_start
-                                                                                                                                                       debug_shell
+dbg_shell_start
+
+# 1st debug shell interval
+debug_shell
+
+# Initialise important kernel modules
 init_devs
-init_overlay
+if [ "$(cmdline_value overlayfs)" != "" ]; then
+	init_overlay
+else
+	init_aufs
+fi
 init_zram
+
+# Then, modprobe everything
 modprobe_everything
 
-# find data dir with filesystem bundles
-DATA="$(find_data 60 "$DATAMNT")"
-                                                                                                                                                      debug_shell
-# setup persistent changes, if possible
+# Find data dir with filesystem bundles
+# NEW: 
+# Only 15 seconds before timeout, to minimize the
+# pain of waiting a "whole" minute.
+#
+DATA="$(find_data 15 "$DATAMNT")"
+
+# 2nd debug shell interval
+debug_shell
+
+# Setup persistent changes
 persistent_changes "$DATA" "$CHANGES"
-                                                                                                                                                      debug_shell
-# copy to RAM if needed
+
+# 3rd debug shell interval
+debug_shell
+
+# Copy data to RAM if requested by user
 DATA="$(copy_to_ram "$DATA" "$CHANGES")"
-                                                                                                                                                      debug_shell
-# init aufs union
-init_union "$CHANGES" "$UNION"
-                                                                                                                                                      debug_shell
-# add data to union
-mkdir $WORK
-mkdir $SYSTEM
-union_append_bundles "$DATA" "$BUNDLES" "$UNION"
+ 
+# Setup an empty union
+if [ "$AUFS_ENABLED" ]; then
+init_union_aufs "$CHANGES" "$UNION"
+fi
+
+if [ "$OVERLAY_ENABLED" ]; then
+init_overlay
+init_union_overlayfs "$CHANGES" "$UNION"
+fi
+
+# 4th debug shell interval
+debug_shell
+
+# Append bundles to union
+#union_append_bundles "$DATA" "$BUNDLES" "$UNION"
+mount_append_bundles "$DATA" "$BUNDLES"
 
 MODPATH="$(cmdline_value modpath)"
 if [ "$MODPATH" != "" ]; then
-union_append_bundles_modpath "$DATAMNT" "$BUNDLES" "$MODPATH" "$UNION"
+mount_append_bundles_modpath "$DATAMNT" "$BUNDLES" "$MODPATH"
 fi
 
-for i in $(find $BUNDLES -type d -maxdepth 1 | sort); do
-	modulesbranches="$i=ro:$modulesbranches"
+for i in $(find $BUNDLES -name "*.${BEXT}" -type d -maxdepth 1 | sort); do
+	if [ "$AUFS_ENABLED" ]; then
+		add_to_aufs_union_bundles $i $UNION
+	fi
+	#modulesbranches="$i=ro:$modulesbranches"
+	modulesbranches="$i:$modulesbranches"
 done
-modulesbranches=$(echo $modulesbranches | sed 's/:$//')
-unionfsmodulesbranches=$(echo $unionfsmodulesbranches | sed "s|:${BUNDLES}||g") #TODO: Unionfs-
-overlaymodulesbranches=$(echo $modulesbranches | sed "s|=ro||g" | sed "s|:${BUNDLES}$||g")
+modulesbranches=$(echo $modulesbranches | sed "s|:$||g")
+#overlaymodulesbranches=$(echo $modulesbranches | sed "s|=ro||g")
 
-if [ -z "$aufs" ]; then
+
+if [ "$OVERLAY_ENABLED" ]; then
 echo "$overlaymodulesbranches" > /modulesbranches.txt
+#mount -t overlay -o ro,lowerdir="$overlaymodulesbranches" overlay "$UNION"
 	if [ "$NOCHANGE" == "" ]; then
 		WORK=$DATA/work
 		CHANGES=$DATA/changes
 	fi
-	mount -t overlay -o workdir=$WORK,upperdir=$CHANGES,lowerdir=$overlaymodulesbranches overlay $UNION
+	mkdir -p $WORK
+	mount -t overlay -o workdir=$WORK,upperdir=$CHANGES,lowerdir=$modulesbranches overlay $UNION
 fi
-																																				  debug_shell
-#if [ ! -z "$hostname" ]; then
-#	if [ ! -z "$domain" ]; then
-#		echo "127.0.0.1 localhost" > $UNION/etc/hosts
-#		echo "127.0.0.1 $hostname.$domain $hostname" >> $UNION/etc/hosts
-#		echo "$hostname.$domain" > $UNION/etc/HOSTNAME
-#	fi
-#fi
 
 if [ ! -z "$hostname" ]; then
 # Configure hostname and network:
@@ -80,7 +116,6 @@ echo "${hostname}.example.net" > ${UNION}/etc/HOSTNAME
 if [ -f ${UNION}/etc/NetworkManager/NetworkManager.conf ]; then
   sed -i ${UNION}/etc/NetworkManager/NetworkManager.conf -e "s/^hostname=.*/hostname=${hostname}/"
 fi
-#sed -e "s/^\(127.0.0.1\t*\)darkstar.*/\1${hostname}.example.net ${hostname}/" -i ${UNION}/etc/hosts
 echo "127.0.0.1 localhost" > ${UNION}/etc/hosts
 echo "127.0.0.1 ${hostname}.example.net ${hostname}" >> ${UNION}/etc/hosts
 fi
@@ -94,7 +129,6 @@ if [ ! -z "$user" ]; then
 		#chroot $UNION /usr/sbin/usermod -G wheel,audio,cdrom,floppy,plugdev,video,power,netdev,lp,scanner,kmem $user
 		chroot $UNION useradd -m -g users -s /bin/bash $user
 		chroot $UNION usermod -G wheel,audio,cdrom,floppy,plugdev,video,power,netdev,lp,scanner,kmem $user
-
 		echo "Setting up $user password"
 		echo "$user:$user" > $UNION/tmp/chpasswd.tmp
 		#chroot $UNION /usr/sbin/chpasswd < $UNION/tmp/chpasswd.tmp
@@ -112,7 +146,7 @@ if [ ! -z "$user" ]; then
 		chmod 640 ${UNION}/etc/sudoers
 		sed -i ${UNION}/etc/sudoers -e 's/# *\(%wheel\sALL=(ALL)\sALL\)/\1/'
 		chmod 440 ${UNION}/etc/sudoers
-		
+
 	else
 		echo "/home/$user folder exists."
 	fi
@@ -149,11 +183,9 @@ if [ ! -z "$xconfig" ]; then
 	if [ -f /root/xorg.conf.new ]; then
 		cp /root/xorg.conf.new $UNION/etc/X11/xorg.conf
 	fi
-	
 	if [ -f $UNION/root/xorg.conf.new ]; then
 		cp $UNION/root/xorg.conf.new $UNION/etc/X11/xorg.conf
 	fi
-	
 fi
 
 if [ ! -z "$nga" ]; then
@@ -173,15 +205,31 @@ if [ ! -z "$lang" ]; then
 	echo "export LC_COLLATE=${lang}" >> $UNION/etc/profile.d/lang.sh
 fi
 
-# rootcopy
+# 5th debug shell interval
+debug_shell
+
+# Copy contents of 'rootcopy/'
 copy_rootcopy_content "$DATA" "$UNION"
 
-# create empty fstab
+# Generate a basic 'fstab' with the core filesystems
+if [ "$AUFS_ENABLED" ]; then
+	fstab_create_aufs "$UNION"
+fi
+if [ "$OVERLAY_ENABLED" ]; then
+	fstab_create_overlay "$UNION"
+fi
 fstab_create "$UNION"
-                                                                                                                                                      debug_shell
-header "Live Kit done, starting $LIVEKITNAME"
-change_root "$UNION"
-																																					  debug_shell
 
-header "!!ERROR occured, you shouldn't be here.!!"
-/bin/sh
+# 6th and final debug shell interval
+debug_shell
+
+# Declare the end of first 'init' state
+clear
+echo_sign "INIT END"
+
+# Change root to main OS and let the 'init' in the
+# main OS do the rest...
+change_root "$UNION"
+
+# < ======== NOTHING SHOULD GO OVER THIS LINE! ======== >
+fatal "Unknown error!"
