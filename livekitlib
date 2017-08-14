@@ -32,7 +32,7 @@ get_lowerdirs()
 	BUND_EXT="$2"
 	MNT_OPT=""
 
-	MNT_OPT="$(find "$BUND_DIRS" -depth -type d | sed '$ d' | grep ".$BUND_EXT" | \
+	MNT_OPT="$(find "$BUND_DIRS" -name "*.$BUND_EXT" -maxdepth 1 -type d | sort | \
 	while read BUND; do echo -n "${BUND}:"; done)"
 	MNT_OPT="${MNT_OPT%?}"
 	echo "$MNT_OPT"
@@ -232,7 +232,8 @@ transfer_initramfs()
 init_proc_sysfs()
 {
    debug_log "init_proc_sysfs" "$*"
-   mkdir -p /proc /sys /etc "$MEMORY"
+   mkdir -p /proc /sys /etc 
+   mkdir -p "$UNION" "$CHANGES" "$BUNDLES" "$DATAMNT"
    mount -n -t proc proc /proc
    echo "0" >/proc/sys/kernel/printk
    mount -n -t sysfs sysfs /sys
@@ -296,7 +297,7 @@ modprobe_overlay()
     debug_log "modprobe_overlay" "$*"
 
     # Prepare for error messages
-    echo >>/var/log/livkekit-log
+    echo >>/var/log/livekit-log
 
     modprobe overlay 2>/var/log/livekit-log
 
@@ -573,6 +574,7 @@ persistent_changes()
 
     # If persistent changes are not requested, end here
     if grep -vq 'perch' /proc/cmdline; then
+        NOCHANGE="yes"
         return
     fi
 
@@ -688,6 +690,40 @@ sortmod()
 
 # Mount squashfs filesystem bundles
 # and add them to union
+# $1 = directory where to search for bundles
+# $2 = directory where to mount bundles
+# $3 = modpath option to add more modules (optional)
+mount_append_bundles()
+{
+    debug_log "mount_append_bundles" "$*"
+
+    local BUN modpath
+    
+    if [ "$3" == "" ]; then
+        modpath="modules"
+    else
+		modpath="$3"
+	fi
+
+    echo_livekit >&2
+    echo "Appending bundles for union setup..." >&2
+
+    # Just tell me why! Why be compact?!?
+    ( ls -1 "$1" | sort -n ; cd "$1" ; find "$modpath"/ 2>/dev/null | \
+    sortmod | filter_load) | grep '[.]'$BEXT'$' |\
+    filter_noload | \
+    while read BUNDLE; do
+        BUN="$(basename "$BUNDLE")"
+        echo_livekit_msg "Mounting $BUN to $BUNDLES ..." >&2
+        mkdir -p "$2/$BUN"
+
+        # It now depends on your kernel!
+        mount -o loop -t squashfs "$1/$BUNDLE" "$2/$BUN"
+    done
+}
+
+# Mount squashfs filesystem bundles
+# and add them to union
 # NEW: Prepare Overlay file system
 # $1 = directory where to search for bundles
 # $2 = directory where to mount bundles
@@ -700,25 +736,16 @@ prepare_overlay()
 
     local BUN ALL_BUNDS LOWERDIR UPPERDIR WORKDIR
 
-    echo_livekit_msg "Preparing OverlayFS union..." >&2
-    echo >>/var/log/livekit-log
-    # Just tell me why! Why be compact?!?
-    ( ls -1 "$1" | sort -n ; cd "$1" ; find modules/ 2>/dev/null | \
-    sortmod | filter_load) | grep '[.]'$BEXT'$' |\
-    filter_noload | \
-    while read BUNDLE; do
-        BUN="$(basename "$BUNDLE")"
-        echo_livekit_msg "Mounting $BUN to /memory/bundles..." >&2
-        mkdir -p "$2/$BUN"
-
-        # It now depends on your kernel!
-        mount -o loop -t squashfs "$1/$BUNDLE" "$2/$BUN"
-    done
+    mount_append_bundles "$1" "$2"
+	MODPATH="$(cmdline_value modpath)"
+	if [ "$MODPATH" != "" ]; then
+		mount_append_bundles "$1" "$2" "$MODPATH"
+	fi
 
     ALL_BUNDS="$(get_lowerdirs "$2" "$BEXT")"
-    LOWERDIR="/memory/lowerdir"
+    LOWERDIR="$MEMORY/lowerdir"
     UPPERDIR="$3"
-    WORKDIR="${UPPERDIR}/.workdir"
+    WORKDIR="$MEMORY/work"
 
     # Make the workdir (cuz it's non-existant, yet...)
     mkdir "$WORKDIR" >/dev/null 2>&1
@@ -726,6 +753,10 @@ prepare_overlay()
     # I think this is a work-around
     # Separating 2 commands to avoid overflow (aka avoid triggering "Argument list to long" error)
     mkdir "$LOWERDIR" >/dev/null 2>&1
+    if [ "$NOCHANGE" == "" ]; then
+        WORKDIR=$DATA/work
+        UPPERDIR=$DATA/changes
+    fi
     mount -t overlay -o lowerdir="$ALL_BUNDS" overlay "$LOWERDIR" >>/var/log/livekit-log 2>&1 && \
     mount -t overlay -o lowerdir="$LOWERDIR",upperdir="$UPPERDIR",workdir="$WORKDIR" \
     overlay "$4" >>/var/log/livekit-log 2>&1
@@ -777,14 +808,14 @@ change_root()
     if [ ! -e dev/null ]; then mknod dev/null c 1 3; fi
 
     # find chroot and init
-    if [ -x bin/chroot -o -L bin/chroot ]; then  CHROOT=bin/chroot; fi
-    if [ -x sbin/chroot -o -L sbin/chroot ]; then  CHROOT=sbin/chroot; fi
-    if [ -x usr/bin/chroot -o -L usr/bin/chroot ]; then  CHROOT=usr/bin/chroot; fi
-    if [ -x usr/sbin/chroot -o -L usr/sbin/chroot ]; then CHROOT=usr/sbin/chroot; fi
+    if [ -x $UNION/bin/chroot -o -L $UNION/bin/chroot ]; then  CHROOT=bin/chroot; fi
+    if [ -x $UNION/sbin/chroot -o -L $UNION/sbin/chroot ]; then  CHROOT=sbin/chroot; fi
+    if [ -x $UNION/usr/bin/chroot -o -L $UNION/usr/bin/chroot ]; then  CHROOT=usr/bin/chroot; fi
+    if [ -x $UNION/usr/sbin/chroot -o -L $UNION/usr/sbin/chroot ]; then CHROOT=usr/sbin/chroot; fi
     if [ "$CHROOT" = "" ]; then fatal "chroot: Executable not found!"; fi
 
-    if [ -x bin/init -o -L bin/init ]; then INIT=bin/init; fi
-    if [ -x sbin/init -o -L sbin/init  ]; then INIT=sbin/init; fi
+    if [ -x $UNON/bin/init -o -L $UNION/bin/init ]; then INIT=bin/init; fi
+    if [ -x $UNION/sbin/init -o -L $UNION/sbin/init  ]; then INIT=sbin/init; fi
     if [ "$INIT" = "" ]; then fatal "init: Executable not found!"; fi
 
     mkdir -p mnt/live
