@@ -739,7 +739,7 @@ prepare_overlay()
     mount_append_bundles "$1" "$2"
 	MODPATH="$(cmdline_value modpath)"
 	if [ "$MODPATH" != "" ]; then
-		mount_append_bundles "$1" "$2" "$MODPATH"
+		mount_append_bundles "$DATAMNT" "$2" "$MODPATH"
 	fi
 
     ALL_BUNDS="$(get_lowerdirs "$2" "$BEXT")"
